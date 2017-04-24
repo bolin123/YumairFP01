@@ -1,8 +1,9 @@
 #include "YumairProtocol.h"
-#include "GPRS.h"
 #include "YumairPrivate.h"
 #include "SysTimer.h"
+#include "VTList.h"
 #include "HTTPRequest.h"
+#include "GPRS.h"
 #include "MD5.h"
 
 #define YP_SERVER_HOST "test.machtalk.net"
@@ -12,8 +13,11 @@
 //#define YP_SERVER_PORT 10066
 
 #define YP_NEED_MAINTAIN_LINK 0 //是否发送心跳维护链接
-#define YP_HEARTBEAT_TIME  60000 //1s
+#define YP_HEARTBEAT_TIME  60000 //1min
 #define YP_TIME_ADJUST_TIME (20*60*1000) //20分钟 校时时间
+
+#define YP_QN_NUM_LEN  18
+#define YP_QN_TIMEOUT  60000 //1min 应答超时时间
 
 typedef enum
 {
@@ -21,6 +25,14 @@ typedef enum
     SERVER_CONNECTED,
     SERVER_LOGIN,
 }YPServerStatus_t;
+
+typedef struct YPReplyQn_st
+{
+    uint32_t id;
+    char *num;
+    SysTime_t timeout;
+    VTLIST_ENTRY(struct YPReplyQn_st);
+}YPReplyQn_t;
 
 static uint8_t g_reconnectCount = 0;
 static YPServerStatus_t g_serverStatus = SERVER_DISCONNECT;
@@ -31,8 +43,10 @@ static bool g_start = false;
 static uint64_t g_faultNum = 0;
 static YPEvent_cb g_eventHandle = NULL;
 static char *g_sensorName[SENSOR_TYPE_COUNT] = {"PM25", "CO", "NO2", "SO2", "O3", "VOC", "NOISE"};
-static char g_qnNum[18] = {0};
+//static char g_qnNum[18] = {0};
+static YPReplyQn_t g_replyQN;
 
+static uint32_t g_otaReplyID;
 static SysOtaInfo_t g_otaInfo;
 static HTTPRequest_t *g_otaHttp = NULL;
 
@@ -377,26 +391,131 @@ SysDateTime_t *dataTimeConvert(const char *timestr)
     return NULL;
 }
 
-void YPSensorParamSend(YPSensorParam_t *param)
+static void replyQnTimeoutHandle(void)
+{
+    YPReplyQn_t *qn;
+
+    VTListForeach(&g_replyQN, qn)
+    {
+        if(SysTimeHasPast(qn->timeout, YP_QN_TIMEOUT))
+        {
+            YPriOptResultSend(qn->num, OPT_RESULT_FAILED);
+            VTListDel(qn);
+            if(qn->num)
+            {
+                free(qn->num);
+            }
+            free(qn);
+        }
+    }
+}
+
+static uint32_t replyQnInsert(const char *qnNum)
+{
+    YPReplyQn_t *qn;
+    
+    qn = (YPReplyQn_t *)malloc(sizeof(YPReplyQn_t));
+    if(qn)
+    {
+        qn->num = (char *)malloc(YP_QN_NUM_LEN);
+        if(qn->num)
+        {
+            strncpy(qn->num, qnNum, YP_QN_NUM_LEN);
+        }
+        qn->id = SysTime();
+        qn->timeout = SysTime();
+        VTListAdd(&g_replyQN, qn);
+        return qn->id;
+    }
+    return 0;
+}
+
+YPReplyQn_t *getReplyQn(uint32_t qnID)
+{
+    YPReplyQn_t *qn = NULL;
+    
+    VTListForeach(&g_replyQN, qn)
+    {
+        if(qn->id == qnID)
+        {
+            return qn;
+        }
+    }
+
+    return NULL;
+}
+
+void YPOptResultSend(uint32_t ackid, bool success)
+{
+    YPReplyQn_t *qn = getReplyQn(ackid);
+
+    if(qn)
+    {
+        if(success)
+        {
+            YPriOptResultSend(qn->num, OPT_RESULT_SUCCESS);
+        }
+        else
+        {
+            YPriOptResultSend(qn->num, OPT_RESULT_FAILED);
+        }
+        
+        VTListDel(qn);
+        if(qn->num)
+        {
+            free(qn->num);
+        }
+        free(qn);
+    }
+}
+
+void YPSensorParamSend(YPSensorParam_t *param, uint32_t ackid)
 {
     uint8_t i;
     uint16_t len = 0;
-    char *buff = malloc(param->valnum * 15 + 50); //15-float value length, 50 others
-    //Calib-Method=2,Calib-Target=PM2.5,Calib-Param=[1,2]
+    char *buff = NULL;
+    YPReplyQn_t *qn = getReplyQn(ackid);
 
-    if(buff)
+    if(param == NULL)
     {
-        len += sprintf(buff, "Calib-Method=%d,Calib-Target=%s,Calib-Param=[", param->method, g_sensorName[param->target]);
-        for(i = 0; i < param->valnum - 1; i++)
-        {
-            len += sprintf(buff + len, "%f,", param->value[i]);
-        }
-        len += sprintf(buff + len, "%f]", param->value[param->valnum - 1]);
-        YPriPostData(YP_CMD_GET_ARGS, g_qnNum, buff);
-        free(buff);
-        
-        YPriOptResultSend(g_qnNum, OPT_RESULT_SUCCESS);
+        return;
     }
+    SysLog("");
+
+    if(qn)
+    {
+        if(param->value != NULL)
+        {
+            buff = malloc(param->valnum * 15 + 50); //15-float value length, 50 others
+        
+            if(buff)
+            {
+                //Calib-Method=2,Calib-Target=PM2.5,Calib-Param=[1,2]
+                len += sprintf(buff, "Calib-Method=%d,Calib-Target=%s,Calib-Param=[", param->method, g_sensorName[param->target]);
+                for(i = 0; i < param->valnum - 1; i++)
+                {
+                    len += sprintf(buff + len, "%f,", param->value[i]);
+                }
+                len += sprintf(buff + len, "%f]", param->value[param->valnum - 1]);
+                YPriPostData(YP_CMD_GET_ARGS, qn->num, buff);
+                free(buff);
+                
+                YPriOptResultSend(qn->num, OPT_RESULT_SUCCESS);
+            }
+        }
+        else
+        {
+            YPriOptResultSend(qn->num, OPT_RESULT_FAILED);
+        }
+
+        VTListDel(qn);
+        if(qn->num)
+        {
+            free(qn->num);
+        }
+        free(qn);
+    }
+    
 }
 
 static int8_t parseSensorParam(const char *text, YPSensorParam_t *param)
@@ -533,16 +652,20 @@ static void httpRequestCallback(HTTPRequest_t *request, const uint8_t *data, uin
             {
                 g_otaInfo.flag = SYS_OTA_DONE_FLAG;
                 SysUpdateOtaInfo(&g_otaInfo);
-                g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_SUCCESS);
+                g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_SUCCESS, 0);
+                YPOptResultSend(g_otaReplyID, true);
+                
             }
             else
             {
-                g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_FAILED);
+                g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_FAILED, 0);
+                YPOptResultSend(g_otaReplyID, false);
             }
         }
         else
         {
-            g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_FAILED);
+            g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_FAILED, 0);
+            YPOptResultSend(g_otaReplyID, false);
         }
         HTTPRequestDestroy(g_otaHttp);
         g_otaHttp = NULL;
@@ -551,7 +674,8 @@ static void httpRequestCallback(HTTPRequest_t *request, const uint8_t *data, uin
     {
         HTTPRequestDestroy(g_otaHttp);
         g_otaHttp = NULL;
-        g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_FAILED);
+        g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_FAILED, 0);
+        YPOptResultSend(g_otaReplyID, false);
     }
 }
 
@@ -627,7 +751,7 @@ static void otaHandle(char *msg)
                 HTTPRequestStart(g_otaHttp);
                 free(url);
 
-                g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_START);
+                g_eventHandle(YP_EVENT_OTA, (void *)OTA_STATUS_START, 0);
             }
         }
     }
@@ -639,6 +763,7 @@ static void serverRequestHandle(YPriSetMsg_t *msg)
     char data[128] = {0};
     SysLocation_t *location;
     YPSensorParam_t sersorParam;
+//    YPReplyQn_t *qn;
 
     SysLog("msgID = %d", msg->mid);
     
@@ -661,12 +786,12 @@ static void serverRequestHandle(YPriSetMsg_t *msg)
                 g_reportInterval = strtol(ptr, NULL, 10);
                 SysSetReportInterval(g_reportInterval);
                 YPriOptResultSend(msg->qn, OPT_RESULT_SUCCESS);
-                g_eventHandle(YP_EVENT_SET_POST_INTERVAL, (void *)g_reportInterval);
+                g_eventHandle(YP_EVENT_SET_POST_INTERVAL, (void *)g_reportInterval, 0);
             }
             break;
         case YP_CMD_RESET: //复位
             YPriOptResultSend(msg->qn, OPT_RESULT_SUCCESS);
-            g_eventHandle(YP_EVENT_REBOOT, NULL);
+            g_eventHandle(YP_EVENT_REBOOT, NULL, 0);
             break;
         case YP_CMD_GET_ARGS: //读取参数
             if(parseSensorParam(msg->value, &sersorParam) < 0)
@@ -675,9 +800,7 @@ static void serverRequestHandle(YPriSetMsg_t *msg)
             }
             else
             {
-                g_qnNum[0] = '\0';
-                strcpy(g_qnNum, msg->qn);
-                g_eventHandle(YP_EVENT_READ_SENSOR_ARGS, &sersorParam);
+                g_eventHandle(YP_EVENT_READ_SENSOR_ARGS, &sersorParam, replyQnInsert(msg->qn));
             }
 
             if(sersorParam.value)
@@ -693,8 +816,8 @@ static void serverRequestHandle(YPriSetMsg_t *msg)
             }
             else
             {
-                g_eventHandle(YP_EVENT_SET_SENSOR_ARGS, &sersorParam);
-                YPriOptResultSend(msg->qn, OPT_RESULT_SUCCESS);
+                g_eventHandle(YP_EVENT_SET_SENSOR_ARGS, &sersorParam, replyQnInsert(msg->qn));
+                //YPriOptResultSend(msg->qn, OPT_RESULT_SUCCESS);
             }
             
             if(sersorParam.value)
@@ -704,10 +827,10 @@ static void serverRequestHandle(YPriSetMsg_t *msg)
             }
             break;
         case YP_CMD_OTA:
-            // TODO: event emitt
+            g_otaReplyID = replyQnInsert(msg->qn);
             otaHandle(msg->value);
-            g_qnNum[0] = '\0';
-            strcpy(g_qnNum, msg->qn);
+            //g_qnNum[0] = '\0';
+            //strcpy(g_qnNum, msg->qn);
             break;
         case YP_CMD_GET_LOCATION: //定位
             location = SysGetLocation();
@@ -792,15 +915,17 @@ void YPPoll(void)
     if(g_start)
     {
         serverLinkHandle();
+        replyQnTimeoutHandle();
+        heartbeatSend();
+        updateDeviceTime();
+        YPriPoll();
     }
     GPRSPoll();
-    YPriPoll();
-    heartbeatSend();
-    updateDeviceTime();
 }
 
 void YPInitialize(void)
 {
+    VTListInit(&g_replyQN);
     GPRSInitialize();
     GPRSEventHandleRegister(gprsEventHandle);
     YPriInitialize();

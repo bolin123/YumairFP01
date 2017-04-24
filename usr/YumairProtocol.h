@@ -39,10 +39,11 @@ typedef enum
     YP_EVENT_OTA,        //ota
 }YPEvent_t;
 
-typedef void (* YPEvent_cb)(YPEvent_t event, void *args);
+typedef void (* YPEvent_cb)(YPEvent_t event, void *opt, uint32_t ackid);
 
 int8_t YPFaultsReport(uint8_t faults[], uint8_t num);
-void YPSensorParamSend(YPSensorParam_t *param);
+void YPSensorParamSend(YPSensorParam_t *param, uint32_t ackid);
+void YPOptResultSend(uint32_t ackid, bool success);
 int8_t YPPostAllProperties(void);
 int8_t YPPropertySet(const char *name, float value, uint8_t flag);
 int8_t YPPropertyRegister(const char *name, const char *flagName);

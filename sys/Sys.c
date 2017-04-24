@@ -5,7 +5,7 @@
 #include "testProtocol.h"
 
 
-static char g_version[8] = "1.0.0.1";
+static char g_version[8] = "1.0.0.2";
 static char g_devType[10];
 static SysDateTime_t g_sysDateTime;
 static SysLocation_t g_location;

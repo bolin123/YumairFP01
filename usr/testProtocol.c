@@ -3,7 +3,7 @@
 
 static bool g_otaStart = false;
 
-static void eventHandle(YPEvent_t event, void *args)
+static void eventHandle(YPEvent_t event, void *args, uint32_t ackid)
 {
     uint8_t i;
     YPOtaStatus_t otaStatus;
@@ -26,6 +26,11 @@ static void eventHandle(YPEvent_t event, void *args)
                 SysPrintf("%0.4f,", param->value[i]);
             }
             SysPrintf("]\n");
+            YPOptResultSend(ackid, true);
+        }
+        else
+        {
+            YPOptResultSend(ackid, false);
         }
     }
     else if(YP_EVENT_READ_SENSOR_ARGS == event)
@@ -39,7 +44,7 @@ static void eventHandle(YPEvent_t event, void *args)
             paramSend->target = param->target;
             paramSend->valnum = 10;
             paramSend->value = svalue;
-            YPSensorParamSend(paramSend);
+            YPSensorParamSend(paramSend, ackid);
             free(paramSend);
         }
     }
